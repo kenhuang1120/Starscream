@@ -29,9 +29,11 @@ public enum FoundationSecurityError: Error {
 
 public class FoundationSecurity  {
     var allowSelfSigned = false
+    var allowCredentialHosts: [String] = []
     
-    public init(allowSelfSigned: Bool = false) {
+    public init(allowSelfSigned: Bool = false, allowCredentialHosts: [String] = []) {
         self.allowSelfSigned = allowSelfSigned
+        self.allowCredentialHosts = allowCredentialHosts
     }
     
     
@@ -40,6 +42,11 @@ public class FoundationSecurity  {
 extension FoundationSecurity: CertificatePinning {
     public func evaluateTrust(trust: SecTrust, domain: String?, completion: ((PinningState) -> ())) {
         if allowSelfSigned {
+            completion(.success)
+            return
+        }
+        
+        if let domain = domain, allowCredentialHosts.contains(domain) {
             completion(.success)
             return
         }

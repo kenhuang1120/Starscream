@@ -26,7 +26,13 @@ import Foundation
 public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionWebSocketDelegate {
     private var task: URLSessionWebSocketTask?
     weak var delegate: EngineDelegate?
-
+    private var certPinner: CertificatePinning? = nil
+    
+    
+    init(certPinner: CertificatePinning?) {
+        self.certPinner = certPinner
+    }
+    
     public func register(delegate: EngineDelegate) {
         self.delegate = delegate
     }
@@ -111,5 +117,28 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
     
     public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         broadcast(event: .error(error))
+    }
+    
+    public func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        
+        guard let serverTrust = challenge.protectionSpace.serverTrust else {
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+
+        if certPinner != nil {
+            certPinner?.evaluateTrust(trust: serverTrust, domain: challenge.protectionSpace.host) { (state) in
+                switch state {
+                case .success:
+                    let credential = URLCredential(trust: serverTrust)
+                    completionHandler(.useCredential, credential)
+                case .failed(_):
+                    completionHandler(.cancelAuthenticationChallenge, nil)
+                }
+            }
+            return
+        }
+
+        completionHandler(.useCredential, nil)
     }
 }
