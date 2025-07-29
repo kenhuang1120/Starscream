@@ -72,9 +72,13 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
         outStream.delegate = self
     
         if isTLS {
-            let key = CFStreamPropertyKey(rawValue: kCFStreamPropertySocketSecurityLevel)
-            CFReadStreamSetProperty(inStream, key, kCFStreamSocketSecurityLevelNegotiatedSSL)
-            CFWriteStreamSetProperty(outStream, key, kCFStreamSocketSecurityLevelNegotiatedSSL)
+            inStream.setProperty(StreamSocketSecurityLevel.negotiatedSSL, forKey: Stream.PropertyKey.socketSecurityLevelKey)
+            outStream.setProperty(StreamSocketSecurityLevel.negotiatedSSL, forKey: Stream.PropertyKey.socketSecurityLevelKey)
+                
+            let sslSettings = [NSString(format: kCFStreamSSLValidatesCertificateChain): kCFBooleanFalse] as [NSString : CFBoolean]
+                 
+            inStream.setProperty(sslSettings, forKey: kCFStreamPropertySSLSettings as Stream.PropertyKey)
+            outStream.setProperty(sslSettings, forKey: kCFStreamPropertySSLSettings as Stream.PropertyKey)
         }
         
         onConnect?(inStream, outStream)
