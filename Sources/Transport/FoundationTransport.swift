@@ -31,9 +31,18 @@ public enum FoundationTransportError: Error {
 public class FoundationTransport: NSObject, Transport, StreamDelegate {
     private var delegate: TransportEventClient?
     private let workQueue = DispatchQueue(label: "com.vluxe.starscream.websocket", attributes: [])
+    private let accessQueue = DispatchQueue(label: "com.vluxe.starscream.access", attributes: .concurrent)
     private var inputStream: InputStream?
     private var outputStream: OutputStream?
-    private var isOpen = false
+    private var _isOpen = false
+    private var isOpen: Bool {
+        get {
+            return accessQueue.sync { _isOpen }
+        }
+        set {
+            accessQueue.async(flags: .barrier) { self._isOpen = newValue }
+        }
+    }
     private var onConnect: ((InputStream, OutputStream) -> Void)?
     private var isTLS = false
     private var certPinner: CertificatePinning?
@@ -64,8 +73,8 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
         var writeStream: Unmanaged<CFWriteStream>?
         let h = parts.host as NSString
         CFStreamCreatePairWithSocketToHost(nil, h, UInt32(parts.port), &readStream, &writeStream)
-        inputStream = readStream!.takeRetainedValue()
-        outputStream = writeStream!.takeRetainedValue()
+        inputStream = readStream?.takeRetainedValue()
+        outputStream = writeStream?.takeRetainedValue()
         guard let inStream = inputStream, let outStream = outputStream else {
                 return
         }
@@ -146,28 +155,36 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
         guard let outputStream = outputStream else {
             return (nil, nil)
         }
+        
+        // 安全地獲取 trust，避免強制解包
         let trust = outputStream.property(forKey: kCFStreamPropertySSLPeerTrust as Stream.PropertyKey) as! SecTrust?
         var domain = outputStream.property(forKey: kCFStreamSSLPeerName as Stream.PropertyKey) as! String?
         
         if domain == nil,
-            let sslContextOut = CFWriteStreamCopyProperty(outputStream, CFStreamPropertyKey(rawValue: kCFStreamPropertySSLContext)) as! SSLContext? {
+           let sslContextOut = CFWriteStreamCopyProperty(outputStream, CFStreamPropertyKey(rawValue: kCFStreamPropertySSLContext)) as! SSLContext? {
             
             if #available(iOS 13.0, macOS 10.15, *) {
                 if let streamDomain = outputStream.property(forKey: kCFStreamSSLPeerName as Stream.PropertyKey) as? String {
-                        domain = streamDomain
-                } else {
-                    // 如果無法從 stream 獲取，可以從 SSL context 嘗試其他方式
-                    // 或者使用 URL 中的 host 作為 fallback
-                    domain = nil
+                    domain = streamDomain
                 }
             } else {
                 var peerNameLen: Int = 0
-                SSLGetPeerDomainNameLength(sslContextOut, &peerNameLen)
-                var peerName = Data(count: peerNameLen)
-                let _ = peerName.withUnsafeMutableBytes { (peerNamePtr: UnsafeMutablePointer<Int8>) in
-                    SSLGetPeerDomainName(sslContextOut, peerNamePtr, &peerNameLen)
+                let status = SSLGetPeerDomainNameLength(sslContextOut, &peerNameLen)
+                guard status == errSecSuccess, peerNameLen > 0 else {
+                    return (trust, domain)
                 }
-                if let peerDomain = String(bytes: peerName, encoding: .utf8), peerDomain.count > 0 {
+                
+                var peerName = Data(count: peerNameLen)
+                let result = peerName.withUnsafeMutableBytes { (peerNamePtr: UnsafeMutableRawBufferPointer) in
+                    guard let baseAddress = peerNamePtr.bindMemory(to: Int8.self).baseAddress else {
+                        return errSecParam
+                    }
+                    return SSLGetPeerDomainName(sslContextOut, baseAddress, &peerNameLen)
+                }
+                
+                if result == errSecSuccess,
+                   let peerDomain = String(bytes: peerName.prefix(peerNameLen), encoding: .utf8),
+                   !peerDomain.isEmpty {
                     domain = peerDomain
                 }
             }
