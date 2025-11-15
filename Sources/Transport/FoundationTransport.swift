@@ -109,10 +109,6 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
     }
     
     public func disconnect() {
-        accessQueue.async(flags: .barrier) {
-            self._isOpen = false
-            self.delegate = nil
-        }
         if let stream = inputStream {
             stream.delegate = nil
             CFReadStreamSetDispatchQueue(stream, nil)
@@ -123,8 +119,10 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
             CFWriteStreamSetDispatchQueue(stream, nil)
             stream.close()
         }
+        isOpen = false
         outputStream = nil
         inputStream = nil
+        delegate = nil
     }
     
     public func register(delegate: TransportEventClient?) {
