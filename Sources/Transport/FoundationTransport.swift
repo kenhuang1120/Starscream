@@ -109,6 +109,10 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
     }
     
     public func disconnect() {
+        accessQueue.async(flags: .barrier) {
+            self._isOpen = false
+            self.delegate = nil
+        }
         if let stream = inputStream {
             stream.delegate = nil
             CFReadStreamSetDispatchQueue(stream, nil)
@@ -119,10 +123,8 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
             CFWriteStreamSetDispatchQueue(stream, nil)
             stream.close()
         }
-        isOpen = false
         outputStream = nil
         inputStream = nil
-        delegate = nil
     }
     
     public func register(delegate: TransportEventClient?) {
@@ -134,18 +136,20 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
             completion(FoundationTransportError.invalidOutputStream)
             return
         }
-        var total = 0
-        let buffer = UnsafeRawPointer((data as NSData).bytes).assumingMemoryBound(to: UInt8.self)
-        //NOTE: this might need to be dispatched to the work queue instead of being written inline. TBD.
-        while total < data.count {
-            let written = outStream.write(buffer, maxLength: data.count)
-            if written < 0 {
-                completion(FoundationTransportError.invalidOutputStream)
-                return
+        
+        data.withUnsafeBytes { bytes in
+            let buffer = bytes.bindMemory(to: UInt8.self)
+            var total = 0
+            while total < data.count {
+                let written = outStream.write(buffer.baseAddress! + total, maxLength: data.count - total)
+                if written < 0 {
+                    completion(FoundationTransportError.invalidOutputStream)
+                    return
+                }
+                total += written
             }
-            total += written
+            completion(nil)
         }
-        completion(nil)
     }
     
     private func getSecurityData() -> (SecTrust?, String?) {
@@ -169,14 +173,14 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
         var domain = outputStream.property(forKey: kCFStreamSSLPeerName as Stream.PropertyKey) as? String
 
         
-        if domain == nil,
-           let sslContextOut = CFWriteStreamCopyProperty(outputStream, CFStreamPropertyKey(rawValue: kCFStreamPropertySSLContext)) as! SSLContext? {
-            
+        if domain == nil {
             if #available(iOS 13.0, macOS 10.15, *) {
                 if let streamDomain = outputStream.property(forKey: kCFStreamSSLPeerName as Stream.PropertyKey) as? String {
                     domain = streamDomain
+                } else {
+                    domain = nil
                 }
-            } else {
+            } else if let sslContextOut = CFWriteStreamCopyProperty(outputStream, CFStreamPropertyKey(rawValue: kCFStreamPropertySSLContext)) as! SSLContext? {
                 var peerNameLen: Int = 0
                 let status = SSLGetPeerDomainNameLength(sslContextOut, &peerNameLen)
                 guard status == errSecSuccess, peerNameLen > 0 else {
@@ -196,6 +200,8 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
                    !peerDomain.isEmpty {
                     domain = peerDomain
                 }
+            } else {
+                domain = nil
             }
         }
         return (trust, domain)
@@ -203,12 +209,11 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
     }
     
     private func read() {
-        guard let stream = inputStream else {
-            return
-        }
+        guard let stream = inputStream else { return }
+        
         let maxBuffer = 4096
-        let buf = NSMutableData(capacity: maxBuffer)
-        let buffer = UnsafeMutableRawPointer(mutating: buf!.bytes).assumingMemoryBound(to: UInt8.self)
+        guard let buf = NSMutableData(capacity: maxBuffer) else { return } // 安全檢查
+        let buffer = UnsafeMutableRawPointer(mutating: buf.bytes).assumingMemoryBound(to: UInt8.self)
         let length = stream.read(buffer, maxLength: maxBuffer)
         if length < 1 {
             return
