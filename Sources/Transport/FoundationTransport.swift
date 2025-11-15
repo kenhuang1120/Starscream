@@ -122,7 +122,6 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
         isOpen = false
         outputStream = nil
         inputStream = nil
-        delegate = nil
     }
     
     public func register(delegate: TransportEventClient?) {
