@@ -156,9 +156,18 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
             return (nil, nil)
         }
         
-        // 安全地獲取 trust，避免強制解包
-        let trust = outputStream.property(forKey: kCFStreamPropertySSLPeerTrust as Stream.PropertyKey) as! SecTrust?
-        var domain = outputStream.property(forKey: kCFStreamSSLPeerName as Stream.PropertyKey) as! String?
+        var trust: SecTrust? = nil
+        // raw CFTypeRef from stream
+        if let trustObj = outputStream.property(forKey: kCFStreamPropertySSLPeerTrust as Stream.PropertyKey) {
+            // Check CFTypeID to ensure it *is* SecTrust
+            if CFGetTypeID(trustObj as CFTypeRef) == SecTrustGetTypeID() {
+                trust = (trustObj as! SecTrust)
+            }
+        }
+        
+        // Try to get domain from stream property
+        var domain = outputStream.property(forKey: kCFStreamSSLPeerName as Stream.PropertyKey) as? String
+
         
         if domain == nil,
            let sslContextOut = CFWriteStreamCopyProperty(outputStream, CFStreamPropertyKey(rawValue: kCFStreamPropertySSLContext)) as! SSLContext? {
@@ -240,10 +249,6 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
                     isOpen = true
                     delegate?.connectionChanged(state: .connected)
                 }
-            }
-        case .endEncountered:
-            if aStream == inputStream {
-                delegate?.connectionChanged(state: .cancelled)
             }
         default:
             break
