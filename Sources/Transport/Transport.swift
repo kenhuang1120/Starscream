@@ -55,7 +55,7 @@ public protocol TransportEventClient: AnyObject {
 }
 
 public protocol Transport: AnyObject {
-    func register(delegate: TransportEventClient)
+    func register(delegate: TransportEventClient?)
     func connect(url: URL, timeout: Double, certificatePinning: CertificatePinning?)
     func disconnect()
     func write(data: Data, completion: @escaping ((Error?) -> ()))

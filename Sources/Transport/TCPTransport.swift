@@ -92,7 +92,7 @@ public class TCPTransport: Transport {
         connection = nil
     }
     
-    public func register(delegate: TransportEventClient) {
+    public func register(delegate: TransportEventClient?) {
         self.delegate = delegate
     }
     
@@ -138,31 +138,36 @@ public class TCPTransport: Transport {
     
     //readLoop keeps reading from the connection to get the latest content
     private func readLoop() {
-        if !isRunning {
+        guard isRunning, let connection = connection else {
             return
         }
-        connection?.receive(minimumIncompleteLength: 2, maximumLength: 4096, completion: {[weak self] (data, context, isComplete, error) in
-            guard let s = self else {return}
+        
+        connection.receive(minimumIncompleteLength: 2, maximumLength: 4096, completion: { [weak self] (data, context, isComplete, error) in
+            guard let self = self, self.isRunning else {
+                return
+            }
+            
             if let data = data {
-                s.delegate?.connectionChanged(state: .receive(data))
+                self.delegate?.connectionChanged(state: .receive(data))
             }
             
             // Refer to https://developer.apple.com/documentation/network/implementing_netcat_with_network_framework
             if let context = context, context.isFinal, isComplete {
-                if let delegate = s.delegate {
+                if let delegate = self.delegate {
                     // Let the owner of this TCPTransport decide what to do next: disconnect or reconnect?
                     delegate.connectionChanged(state: .peerClosed)
                 } else {
                     // No use to keep connection alive
-                    s.disconnect()
+                    self.disconnect()
                 }
                 return
             }
             
-            if error == nil {
-                s.readLoop()
+            if error == nil && self.isRunning {
+                self.readLoop()
+            } else if let error = error {
+                self.delegate?.connectionChanged(state: .failed(error))
             }
-
         })
     }
 }

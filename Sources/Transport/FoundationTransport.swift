@@ -29,7 +29,7 @@ public enum FoundationTransportError: Error {
 }
 
 public class FoundationTransport: NSObject, Transport, StreamDelegate {
-    private weak var delegate: TransportEventClient?
+    private var delegate: TransportEventClient?
     private let workQueue = DispatchQueue(label: "com.vluxe.starscream.websocket", attributes: [])
     private var inputStream: InputStream?
     private var outputStream: OutputStream?
@@ -50,6 +50,7 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
     deinit {
         inputStream?.delegate = nil
         outputStream?.delegate = nil
+        delegate = nil
     }
     
     public func connect(url: URL, timeout: Double = 10, certificatePinning: CertificatePinning? = nil) {
@@ -112,9 +113,10 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
         isOpen = false
         outputStream = nil
         inputStream = nil
+        delegate = nil
     }
     
-    public func register(delegate: TransportEventClient) {
+    public func register(delegate: TransportEventClient?) {
         self.delegate = delegate
     }
     
@@ -149,14 +151,25 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
         
         if domain == nil,
             let sslContextOut = CFWriteStreamCopyProperty(outputStream, CFStreamPropertyKey(rawValue: kCFStreamPropertySSLContext)) as! SSLContext? {
-            var peerNameLen: Int = 0
-            SSLGetPeerDomainNameLength(sslContextOut, &peerNameLen)
-            var peerName = Data(count: peerNameLen)
-            let _ = peerName.withUnsafeMutableBytes { (peerNamePtr: UnsafeMutablePointer<Int8>) in
-                SSLGetPeerDomainName(sslContextOut, peerNamePtr, &peerNameLen)
-            }
-            if let peerDomain = String(bytes: peerName, encoding: .utf8), peerDomain.count > 0 {
-                domain = peerDomain
+            
+            if #available(iOS 13.0, macOS 10.15, *) {
+                if let streamDomain = outputStream.property(forKey: kCFStreamSSLPeerName as Stream.PropertyKey) as? String {
+                        domain = streamDomain
+                } else {
+                    // 如果無法從 stream 獲取，可以從 SSL context 嘗試其他方式
+                    // 或者使用 URL 中的 host 作為 fallback
+                    domain = nil
+                }
+            } else {
+                var peerNameLen: Int = 0
+                SSLGetPeerDomainNameLength(sslContextOut, &peerNameLen)
+                var peerName = Data(count: peerNameLen)
+                let _ = peerName.withUnsafeMutableBytes { (peerNamePtr: UnsafeMutablePointer<Int8>) in
+                    SSLGetPeerDomainName(sslContextOut, peerNamePtr, &peerNameLen)
+                }
+                if let peerDomain = String(bytes: peerName, encoding: .utf8), peerDomain.count > 0 {
+                    domain = peerDomain
+                }
             }
         }
         return (trust, domain)
