@@ -28,6 +28,10 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
     weak var delegate: EngineDelegate?
     private var certPinner: CertificatePinning? = nil
     
+    // --- [新增] Ping/Pong 相關屬性 ---
+    private var pingTimer: Timer?
+    public var pingInterval: TimeInterval = 30.0 // 預設每 30 秒 Ping 一次
+    // -------------------------------
     
     init(certPinner: CertificatePinning?) {
         self.certPinner = certPinner
@@ -45,6 +49,9 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
     }
 
     public func stop(closeCode: UInt16) {
+        // [新增] 停止 Ping Timer
+        stopPing()
+        
         let closeCode = URLSessionWebSocketTask.CloseCode(rawValue: Int(closeCode)) ?? .normalClosure
         task?.cancel(with: closeCode, reason: nil)
     }
@@ -92,6 +99,8 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
                 break
             case .failure(let error):
                 self?.broadcast(event: .error(error))
+                // [新增] 讀取失敗時也要停止 Ping
+                self?.stopPing()
                 return
             }
             self?.doRead()
@@ -102,12 +111,56 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
         delegate?.didReceive(event: event)
     }
     
+    // --- [新增] Ping/Pong 邏輯 ---
+    
+    private func startPing() {
+        stopPing() // 確保舊的 Timer 已移除
+        
+        // 為了簡單起見，我們將 Timer 排程在主執行緒
+        // 如果你的 App 對主執行緒非常敏感，可以改用 DispatchSourceTimer
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.pingTimer = Timer.scheduledTimer(withTimeInterval: self.pingInterval, repeats: true) { [weak self] _ in
+                self?.sendPing()
+            }
+        }
+    }
+    
+    private func stopPing() {
+        DispatchQueue.main.async { [weak self] in
+            self?.pingTimer?.invalidate()
+            self?.pingTimer = nil
+        }
+    }
+    
+    private func sendPing() {
+        // 發送 Ping
+        task?.sendPing { [weak self] (error) in
+            if let error = error {
+                // 如果 Ping 發送失敗或沒有收到 Pong (error 不為 nil)
+                // 這通常代表連線已經斷了，NativeEngine 會自動觸發 disconnect，這裡僅作紀錄
+                print("[NativeEngine] Ping failed/timeout: \(error)")
+            } else {
+                // 成功收到 Pong
+                // print("[NativeEngine] Pong received")
+            }
+        }
+    }
+    
+    // ---------------------------
+    
     public func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
         let p = `protocol` ?? ""
         broadcast(event: .connected([HTTPWSHeader.protocolName: p]))
+        
+        // [新增] 連線建立後，開始 Ping
+        startPing()
     }
     
     public func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        // [新增] 連線關閉，停止 Ping
+        stopPing()
+        
         var r = ""
         if let d = reason {
             r = String(data: d, encoding: .utf8) ?? ""
@@ -116,11 +169,14 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
     }
     
     public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        // [新增] 發生錯誤，停止 Ping
+        stopPing()
+        
         broadcast(event: .error(error))
     }
     
     public func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-        
+       
         guard let serverTrust = challenge.protectionSpace.serverTrust else {
             completionHandler(.cancelAuthenticationChallenge, nil)
             return
