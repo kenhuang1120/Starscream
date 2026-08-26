@@ -40,6 +40,12 @@ public class FoundationSecurity  {
 }
 
 extension FoundationSecurity: CertificatePinning {
+    /// 只有在被要求接受自簽憑證、或設定了略過驗證的主機清單時，才需要接管系統驗證。
+    /// 其餘情況一律讓系統先做完整的憑證鏈驗證，這裡再做一次確認。
+    public var overridesSystemTrustEvaluation: Bool {
+        return allowSelfSigned || !allowCredentialHosts.isEmpty
+    }
+
     public func evaluateTrust(trust: SecTrust, domain: String?, completion: ((PinningState) -> ())) {
         if allowSelfSigned {
             completion(.success)
