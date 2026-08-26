@@ -28,6 +28,8 @@ public enum FoundationTransportError: Error {
     case timeout
     /// 無法從連線取得 SecTrust，因此無從驗證伺服器憑證。
     case invalidTrust
+    /// output stream 長時間沒有可寫空間。
+    case writeTimeout
 }
 
 public class FoundationTransport: NSObject, Transport, StreamDelegate {
@@ -64,6 +66,9 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
     /// 在此指定該網域即可正常完成 TLS 驗證（同時作為 SNI 送出）。
     private let tlsPeerName: String?
     private var expectedPeerName: String?
+    
+    /// 單次 write 等待 output stream 出現可寫空間的上限。
+    static let writeTimeout: TimeInterval = 5
     
     public var usingTLS: Bool {
         return self.isTLS
@@ -180,11 +185,22 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
         data.withUnsafeBytes { bytes in
             let buffer = bytes.bindMemory(to: UInt8.self)
             var total = 0
+            let deadline = Date().addingTimeInterval(FoundationTransport.writeTimeout)
             while total < data.count {
                 let written = outStream.write(buffer.baseAddress! + total, maxLength: data.count - total)
                 if written < 0 {
                     completion(FoundationTransportError.invalidOutputStream)
                     return
+                }
+                if written == 0 {
+                    // stream 暫時沒有可寫空間。先前這裡會原地空轉，
+                    // 把呼叫端的執行緒卡住並燒 CPU。
+                    guard Date() < deadline else {
+                        completion(FoundationTransportError.writeTimeout)
+                        return
+                    }
+                    Thread.sleep(forTimeInterval: 0.001)
+                    continue
                 }
                 total += written
             }
@@ -263,15 +279,15 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
     private func read() {
         guard let stream = inputStream else { return }
         
+        // 先前用 NSMutableData(capacity:) 取 bytes 指標再寫入 4096 bytes，
+        // capacity 只是預留容量、length 仍是 0，屬於越界寫入的未定義行為。
         let maxBuffer = 4096
-        guard let buf = NSMutableData(capacity: maxBuffer) else { return } // 安全檢查
-        let buffer = UnsafeMutableRawPointer(mutating: buf.bytes).assumingMemoryBound(to: UInt8.self)
-        let length = stream.read(buffer, maxLength: maxBuffer)
+        var buffer = [UInt8](repeating: 0, count: maxBuffer)
+        let length = stream.read(&buffer, maxLength: maxBuffer)
         if length < 1 {
             return
         }
-        let data = Data(bytes: buffer, count: length)
-        delegate?.connectionChanged(state: .receive(data))
+        delegate?.connectionChanged(state: .receive(Data(buffer[0..<length])))
     }
     
     // MARK: - StreamDelegate

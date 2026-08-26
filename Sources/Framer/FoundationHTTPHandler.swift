@@ -28,9 +28,10 @@ public class FoundationHTTPHandler: HTTPHandler {
 
     var buffer = Data()
     weak var delegate: HTTPHandlerDelegate?
+    private let maxHeaderSize: Int
     
-    public init() {
-        
+    public init(maxHeaderSize: Int = DefaultMaxHTTPHeaderSize) {
+        self.maxHeaderSize = maxHeaderSize
     }
     
     public func convert(request: URLRequest) -> Data {
@@ -51,6 +52,11 @@ public class FoundationHTTPHandler: HTTPHandler {
     }
     
     public func parse(data: Data) -> Int {
+        guard buffer.count + data.count <= maxHeaderSize else {
+            buffer = Data()
+            delegate?.didReceiveHTTP(event: .failure(HTTPUpgradeError.headersTooLarge))
+            return -1
+        }
         let offset = findEndOfHTTP(data: data)
         if offset > 0 {
             buffer.append(data.subdata(in: 0..<offset))

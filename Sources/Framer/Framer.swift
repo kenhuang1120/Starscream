@@ -30,6 +30,9 @@ let RSV1Mask: UInt8         = 0x40
 let MaskMask: UInt8         = 0x80
 let PayloadLenMask: UInt8   = 0x7F
 let MaxFrameSize: Int       = 32
+/// 單一 frame payload 的預設上限。RFC 6455 允許宣告到 2^63-1，
+/// 沒有上限的話伺服器（或中間人）可以直接把 client 的記憶體撐爆。
+public let DefaultMaxPayloadLength: Int = 16 * 1024 * 1024
 
 // Standard WebSocket close codes
 public enum CloseCode: UInt16 {
@@ -90,9 +93,12 @@ public class WSFramer: Framer {
     private var buffer = Data()
     public var compressionEnabled = false
     private let isServer: Bool
+    /// 單一 frame payload 的上限，超過就以 1009 (messageTooBig) 中斷連線。
+    private let maxPayloadLength: Int
     
-    public init(isServer: Bool = false) {
+    public init(isServer: Bool = false, maxPayloadLength: Int = DefaultMaxPayloadLength) {
         self.isServer = isServer
+        self.maxPayloadLength = maxPayloadLength
     }
     
     public func updateCompression(supports: Bool) {
@@ -211,6 +217,13 @@ public class WSFramer: Framer {
             }
             dataLength = UInt64(pointer.readUint16(offset: offset))
             offset += size
+        }
+        
+        // 在等待 payload 進來之前就先擋，否則 buffer 會一路長到宣告的大小。
+        if dataLength > UInt64(maxPayloadLength) {
+            return .failed(WSError(type: .protocolError,
+                                   message: "frame payload length \(dataLength) exceeds the \(maxPayloadLength) byte limit",
+                                   code: CloseCode.messageTooBig.rawValue))
         }
         
         let maskStart = offset

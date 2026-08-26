@@ -48,17 +48,19 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
                 certPinner: CertificatePinning? = nil,
                 headerValidator: HeaderValidator = FoundationSecurity(),
                 httpHandler: HTTPHandler = FoundationHTTPHandler(),
-                framer: Framer = WSFramer(),
+                framer: Framer? = nil,
                 compressionHandler: CompressionHandler? = nil,
-                cookieStorage: HTTPCookieStorage? = .shared) {
+                cookieStorage: HTTPCookieStorage? = .shared,
+                maxMessageSize: Int = DefaultMaxPayloadLength) {
         self.transport = transport
-        self.framer = framer
+        self.framer = framer ?? WSFramer(maxPayloadLength: maxMessageSize)
         self.httpHandler = httpHandler
         self.certPinner = certPinner
         self.headerChecker = headerValidator
         self.compressionHandler = compressionHandler
         self.cookieStorage = cookieStorage
-        framer.updateCompression(supports: compressionHandler != nil)
+        frameHandler.maxMessageSize = maxMessageSize
+        self.framer.updateCompression(supports: compressionHandler != nil)
         frameHandler.delegate = self
     }
     

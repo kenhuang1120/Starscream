@@ -26,7 +26,13 @@ import CommonCrypto
 public enum HTTPUpgradeError: Error {
     case notAnUpgrade(Int, [String: String])
     case invalidData
+    /// HTTP 回應的 header 超過上限，多半代表對方在灌資料。
+    case headersTooLarge
 }
+
+/// 升級回應 header 的累積上限。header 收完前 buffer 是無上限成長的，
+/// 伺服器可以一直送 header 卻永遠不結束。
+public let DefaultMaxHTTPHeaderSize: Int = 64 * 1024
 
 public struct HTTPWSHeader {
     static let upgradeName        = "Upgrade"

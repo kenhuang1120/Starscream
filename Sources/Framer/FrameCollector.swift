@@ -37,6 +37,9 @@ public class FrameCollector {
         case closed(String, UInt16)
     }
     weak var delegate: FrameCollectorDelegate?
+    /// 分段訊息累積後的上限，超過就以 1009 (messageTooBig) 中斷連線。
+    /// 沒有上限的話，對方可以用無盡的 continuation frame 撐爆記憶體。
+    var maxMessageSize: Int = DefaultMaxPayloadLength
     var buffer = Data()
     var frameCount = 0
     var isText = false //was the first frame a text frame or a binary frame?
@@ -78,9 +81,25 @@ public class FrameCollector {
         
         let payload: Data
         if needsDecompression {
-            payload = delegate?.decompress(data: frame.payload, isFinal: frame.isFin) ?? frame.payload
+            // 解壓縮失敗時先前會退回使用壓縮後的原始 bytes，等於把壞掉的
+            // 資料當成正常訊息往上送，也讓解壓縮的大小上限形同虛設。
+            guard let decompressed = delegate?.decompress(data: frame.payload, isFinal: frame.isFin) else {
+                delegate?.didForm(event: .error(WSError(type: .compressionError,
+                                                        message: "failed to decompress frame payload",
+                                                        code: CloseCode.protocolError.rawValue)))
+                reset()
+                return
+            }
+            payload = decompressed
         } else {
             payload = frame.payload
+        }
+        guard buffer.count + payload.count <= maxMessageSize else {
+            delegate?.didForm(event: .error(WSError(type: .protocolError,
+                                                    message: "message exceeds the \(maxMessageSize) byte limit",
+                                                    code: CloseCode.messageTooBig.rawValue)))
+            reset()
+            return
         }
         buffer.append(payload)
         frameCount += 1

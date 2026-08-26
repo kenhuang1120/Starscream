@@ -30,14 +30,19 @@ import Foundation
 import zlib
 
 public class WSCompression: CompressionHandler {
+    /// permessage-deflate 的 windowBits 合法範圍（RFC 7692 §7.1.2）。
+    static let windowBitsRange = 8...15
     let headerWSExtensionName = "Sec-WebSocket-Extensions"
     var decompressor: Decompressor?
     var compressor: Compressor?
     var decompressorTakeOver = false
     var compressorTakeOver = false
+    /// 單次解壓縮的輸出上限。deflate 的壓縮比可以到數千倍，
+    /// 沒有上限的話對方送幾 KB 就能讓 client 配置數百 MB（zip bomb）。
+    let maxDecompressedSize: Int
     
-    public init() {
-        
+    public init(maxDecompressedSize: Int = DefaultMaxPayloadLength) {
+        self.maxDecompressedSize = maxDecompressedSize
     }
     
     public func load(headers: [String: String]) {
@@ -47,19 +52,22 @@ public class WSCompression: CompressionHandler {
 
         // assume defaults unless the headers say otherwise
         compressor = Compressor(windowBits: 15)
-        decompressor = Decompressor(windowBits: 15)
+        decompressor = Decompressor(windowBits: 15, maxDecompressedSize: maxDecompressedSize)
         
         let parts = extensionHeader.components(separatedBy: ";")
         for p in parts {
             let part = p.trimmingCharacters(in: .whitespaces)
             if part.hasPrefix("server_max_window_bits=") {
+                // 值來自伺服器，超出合法範圍就沿用預設的 15，不要照單全收。
                 let valString = part.components(separatedBy: "=")[1]
-                if let val = Int(valString.trimmingCharacters(in: .whitespaces)) {
-                    decompressor = Decompressor(windowBits: val)
+                if let val = Int(valString.trimmingCharacters(in: .whitespaces)),
+                   WSCompression.windowBitsRange.contains(val) {
+                    decompressor = Decompressor(windowBits: val, maxDecompressedSize: maxDecompressedSize)
                 }
             } else if part.hasPrefix("client_max_window_bits=") {
                 let valString = part.components(separatedBy: "=")[1]
-                if let val = Int(valString.trimmingCharacters(in: .whitespaces)) {
+                if let val = Int(valString.trimmingCharacters(in: .whitespaces)),
+                   WSCompression.windowBitsRange.contains(val) {
                     compressor = Compressor(windowBits: val)
                 }
             } else if part == "client_no_context_takeover" {
@@ -106,9 +114,11 @@ class Decompressor {
     private var buffer = [UInt8](repeating: 0, count: 0x2000)
     private var inflateInitialized = false
     private let windowBits: Int
+    private let maxDecompressedSize: Int
 
-    init?(windowBits: Int) {
+    init?(windowBits: Int, maxDecompressedSize: Int = DefaultMaxPayloadLength) {
         self.windowBits = windowBits
+        self.maxDecompressedSize = maxDecompressedSize
         guard initInflate() else { return nil }
     }
 
@@ -159,6 +169,12 @@ class Decompressor {
             }
 
             let byteCount = buffer.count - Int(strm.avail_out)
+            // 每一輪就檢查，避免先配置完幾百 MB 才發現超過上限。
+            guard out.count + byteCount <= maxDecompressedSize else {
+                throw WSError(type: .compressionError,
+                              message: "decompressed data exceeds the \(maxDecompressedSize) byte limit",
+                              code: CloseCode.messageTooBig.rawValue)
+            }
             out.append(buffer, count: byteCount)
         } while res == Z_OK && strm.avail_out == 0
 

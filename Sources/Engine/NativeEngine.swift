@@ -73,7 +73,14 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
                 completion?()
             })
         case .textFrame:
-            let text = String(data: data, encoding: .utf8)!
+            // 先前是強制解包，呼叫 write(stringData:) 傳入非 UTF-8 資料就會 crash。
+            guard let text = String(data: data, encoding: .utf8) else {
+                broadcast(event: .error(WSError(type: .protocolError,
+                                                message: "text frame payload is not valid UTF-8",
+                                                code: CloseCode.encoding.rawValue)))
+                completion?()
+                return
+            }
             write(string: text, completion: completion)
         case .ping:
             task?.sendPing(pongReceiveHandler: { (error) in
