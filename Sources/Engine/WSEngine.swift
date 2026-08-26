@@ -30,6 +30,7 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
     private let compressionHandler: CompressionHandler?
     private let certPinner: CertificatePinning?
     private let headerChecker: HeaderValidator
+    private let cookieStorage: HTTPCookieStorage?
     private var request: URLRequest!
     
     private let frameHandler = FrameCollector()
@@ -48,13 +49,15 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
                 headerValidator: HeaderValidator = FoundationSecurity(),
                 httpHandler: HTTPHandler = FoundationHTTPHandler(),
                 framer: Framer = WSFramer(),
-                compressionHandler: CompressionHandler? = nil) {
+                compressionHandler: CompressionHandler? = nil,
+                cookieStorage: HTTPCookieStorage? = .shared) {
         self.transport = transport
         self.framer = framer
         self.httpHandler = httpHandler
         self.certPinner = certPinner
         self.headerChecker = headerValidator
         self.compressionHandler = compressionHandler
+        self.cookieStorage = cookieStorage
         framer.updateCompression(supports: compressionHandler != nil)
         frameHandler.delegate = self
     }
@@ -140,7 +143,10 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
         switch state {
         case .connected:
             secKeyValue = HTTPWSHeader.generateWebSocketKey()
-            let wsReq = HTTPWSHeader.createUpgrade(request: request, supportsCompression: framer.supportsCompression(), secKeyValue: secKeyValue)
+            let wsReq = HTTPWSHeader.createUpgrade(request: request,
+                                                  supportsCompression: framer.supportsCompression(),
+                                                  secKeyValue: secKeyValue,
+                                                  cookieStorage: cookieStorage)
             let data = httpHandler.convert(request: wsReq)
             transport.write(data: data, completion: {_ in })
         case .waiting:
@@ -187,9 +193,12 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
             canSend = true
             mutex.signal()
             compressionHandler?.load(headers: headers)
-            if let url = request.url {
+            // 只在 TLS 連線上採納伺服器送來的 cookie。明文 ws:// 的 Set-Cookie
+            // 可被任意竄改，寫進共用 storage 後會被 App 其他 HTTPS 流量帶出去，
+            // 形成 session fixation。
+            if let url = request.url, url.isTLSScheme, let cookieStorage = cookieStorage {
                 HTTPCookie.cookies(withResponseHeaderFields: headers, for: url).forEach {
-                    HTTPCookieStorage.shared.setCookie($0)
+                    cookieStorage.setCookie($0)
                 }
             }
 

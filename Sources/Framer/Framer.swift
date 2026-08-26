@@ -21,6 +21,7 @@
 //////////////////////////////////////////////////////////////////////////////////////////////////
 
 import Foundation
+import Security
 
 let FinMask: UInt8          = 0x80
 let OpCodeMask: UInt8       = 0x0F
@@ -272,8 +273,14 @@ public class WSFramer: Framer {
             pointer[1] |= MaskMask
             
             //write the random mask key in
-            let maskKey: UInt32 = UInt32.random(in: 0...UInt32.max)
-            
+            // RFC 6455 §5.3 要求 masking key 必須是無法預測的亂數，
+            // UInt32.random 不是密碼學安全的來源。
+            var maskBytes = [UInt8](repeating: 0, count: MemoryLayout<UInt32>.size)
+            if SecRandomCopyBytes(kSecRandomDefault, maskBytes.count, &maskBytes) != errSecSuccess {
+                maskBytes = maskBytes.map { _ in UInt8.random(in: UInt8.min...UInt8.max) }
+            }
+            let maskKey = maskBytes.withUnsafeBytes { $0.load(as: UInt32.self) }
+
             writeUint32(&pointer, offset: offset, value: maskKey)
             let maskStart = offset
             offset += MemoryLayout<UInt32>.size

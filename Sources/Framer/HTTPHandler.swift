@@ -21,6 +21,7 @@
 //////////////////////////////////////////////////////////////////////////////////////////////////
 
 import Foundation
+import CommonCrypto
 
 public enum HTTPUpgradeError: Error {
     case notAnUpgrade(Int, [String: String])
@@ -47,8 +48,13 @@ public struct HTTPWSHeader {
     /// - Parameter request: the request to "upgrade" the WebSocket request by adding headers.
     /// - Parameter supportsCompression: set if the client support text compression.
     /// - Parameter secKeyName: the security key to use in the WebSocket request. https://tools.ietf.org/html/rfc6455#section-1.3
+    /// - Parameter cookieStorage: 取用 cookie 的來源。傳 nil 表示這條連線完全不帶 cookie，
+    ///   傳入獨立的 storage 可以避免與 App 其他 HTTP 流量共用 cookie。
     /// - returns: A URLRequest request to be converted to data and sent to the server.
-    public static func createUpgrade(request: URLRequest, supportsCompression: Bool, secKeyValue: String) -> URLRequest {
+    public static func createUpgrade(request: URLRequest,
+                                     supportsCompression: Bool,
+                                     secKeyValue: String,
+                                     cookieStorage: HTTPCookieStorage? = .shared) -> URLRequest {
         guard let url = request.url, let parts = url.getParts() else {
             return request
         }
@@ -67,8 +73,8 @@ public struct HTTPWSHeader {
         req.setValue(HTTPWSHeader.versionValue, forHTTPHeaderField: HTTPWSHeader.versionName)
         req.setValue(secKeyValue, forHTTPHeaderField: HTTPWSHeader.keyName)
         
-		if req.allHTTPHeaderFields?["Cookie"] == nil {
-            if let cookies = HTTPCookieStorage.shared.cookies(for: url), !cookies.isEmpty {
+        if req.allHTTPHeaderFields?["Cookie"] == nil {
+            if let cookies = cookieStorage?.cookies(for: url), !cookies.isEmpty {
                 let headers = HTTPCookie.requestHeaderFields(with: cookies)
                 for (key, val) in headers {
                     req.setValue(val, forHTTPHeaderField: key)
@@ -85,9 +91,47 @@ public struct HTTPWSHeader {
         return req
     }
     
-    // generateWebSocketKey 16 random characters between a-z and return them as a base64 string
+    /// generateWebSocketKey 產生 RFC 6455 §4.1 要求的 16 bytes 隨機值並回傳 base64。
+    /// 先前用 `UInt8.random(in: 97...122)`，不但不是密碼學安全的亂數，
+    /// 熵也只有 26^16（約 75 bits）而非要求的 128 bits。
     public static func generateWebSocketKey() -> String {
-        return Data((0..<16).map{ _ in UInt8.random(in: 97...122) }).base64EncodedString()
+        var bytes = [UInt8](repeating: 0, count: 16)
+        if SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) != errSecSuccess {
+            // 極少數情況下 SecRandomCopyBytes 會失敗，退回系統亂數而不是固定值。
+            bytes = (0..<16).map { _ in UInt8.random(in: UInt8.min...UInt8.max) }
+        }
+        return Data(bytes).base64EncodedString()
+    }
+
+    /// 依 RFC 6455 §4.2.2，由 client 的 Sec-WebSocket-Key 算出 Sec-WebSocket-Accept。
+    public static func acceptValue(for key: String) -> String {
+        return "\(key)258EAFA5-E914-47DA-95CA-C5AB0DC85B11".sha1Base64()
+    }
+}
+
+public extension Dictionary where Key == String, Value == String {
+    /// HTTP header 名稱大小寫不敏感。StringHTTPHandler 會把 key 全部轉小寫，
+    /// 直接用 headers["Sec-WebSocket-Accept"] 查會落空。
+    func valueForHTTPHeader(_ name: String) -> String? {
+        if let value = self[name] {
+            return value
+        }
+        let lowercased = name.lowercased()
+        return first(where: { $0.key.lowercased() == lowercased })?.value
+    }
+}
+
+extension String {
+    func sha1Base64() -> String {
+        guard let data = self.data(using: .utf8) else {
+            return ""
+        }
+        let digest = data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) -> [UInt8] in
+            var digest = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
+            CC_SHA1(bytes.baseAddress, CC_LONG(data.count), &digest)
+            return digest
+        }
+        return Data(digest).base64EncodedString()
     }
 }
 

@@ -149,7 +149,17 @@ public class ServerConnection: Connection, HTTPServerDelegate, FramerEventClient
         switch event {
         case .success(let headers):
             didUpgrade = true
-            let response = httpHandler.createResponse(headers: [:])
+            // RFC 6455 §4.2.2：101 回應必須帶 Upgrade / Connection /
+            // Sec-WebSocket-Accept，先前回的是完全沒有 header 的裸 101，
+            // 任何符合規範的 client 都應該要拒絕這種回應。
+            var responseHeaders = [
+                HTTPWSHeader.upgradeName: HTTPWSHeader.upgradeValue,
+                HTTPWSHeader.connectionName: HTTPWSHeader.connectionValue
+            ]
+            if let key = headers.valueForHTTPHeader(HTTPWSHeader.keyName) {
+                responseHeaders[HTTPWSHeader.acceptName] = HTTPWSHeader.acceptValue(for: key)
+            }
+            let response = httpHandler.createResponse(headers: responseHeaders)
             transport.write(data: response, completion: {_ in })
             delegate?.didReceive(event: .connected(self, headers))
             onEvent?(.connected(headers))

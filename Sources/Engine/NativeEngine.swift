@@ -176,25 +176,33 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
     }
     
     public func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-       
+        // 只接管伺服器憑證驗證，其餘（Basic / NTLM / proxy 等）交還系統處理，
+        // 先前一律 cancelAuthenticationChallenge 會讓這些情境直接連不上。
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+
         guard let serverTrust = challenge.protectionSpace.serverTrust else {
             completionHandler(.cancelAuthenticationChallenge, nil)
             return
         }
 
-        if certPinner != nil {
-            certPinner?.evaluateTrust(trust: serverTrust, domain: challenge.protectionSpace.host) { (state) in
-                switch state {
-                case .success:
-                    let credential = URLCredential(trust: serverTrust)
-                    completionHandler(.useCredential, credential)
-                case .failed(_):
-                    completionHandler(.cancelAuthenticationChallenge, nil)
-                }
-            }
+        // 沒有 pinner 就走系統預設驗證。先前用 .useCredential 搭配 nil credential，
+        // 語意未定義，實務上等同不做驗證。
+        guard let certPinner = certPinner else {
+            completionHandler(.performDefaultHandling, nil)
             return
         }
 
-        completionHandler(.useCredential, nil)
+        // host 為 IP 直連時，這裡拿到的就是 IP，會比對憑證的 iPAddress SAN。
+        certPinner.evaluateTrust(trust: serverTrust, domain: challenge.protectionSpace.host) { (state) in
+            switch state {
+            case .success:
+                completionHandler(.useCredential, URLCredential(trust: serverTrust))
+            case .failed(_):
+                completionHandler(.cancelAuthenticationChallenge, nil)
+            }
+        }
     }
 }
