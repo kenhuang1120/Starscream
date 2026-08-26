@@ -30,11 +30,17 @@ public enum TCPTransportError: Error {
 
 @available(macOS 10.14, iOS 12.0, watchOS 5.0, tvOS 12.0, *)
 public class TCPTransport: Transport {
+    /// connection / isRunning 會同時被呼叫端執行緒與 queue 上的 callback 碰到，
+    /// 統一用這把鎖保護，避免 disconnect 與 readLoop 交錯造成的當機。
+    private let stateLock = NSLock()
     private var connection: NWConnection?
     private let queue = DispatchQueue(label: "com.vluxe.starscream.networkstream", attributes: [])
     private weak var delegate: TransportEventClient?
     private var isRunning = false
     private var isTLS = false
+    /// MPTCP 模式。.handover 需要 com.apple.developer.networking.multipath
+    /// entitlement，缺少時連線可能直接失敗，必要時可設為 .disabled。
+    private let multipathServiceType: NWParameters.MultipathServiceType
     /// 憑證要驗證的主機名稱。以 IP 直連、但伺服器憑證只簽了網域名稱時，
     /// 在此指定該網域即可正常完成 TLS 驗證。
     private let tlsPeerName: String?
@@ -49,14 +55,17 @@ public class TCPTransport: Transport {
     
     public init(connection: NWConnection) {
         self.tlsPeerName = nil
+        self.multipathServiceType = .disabled
         self.connection = connection
         start()
     }
     
     /// - Parameter tlsPeerName: 憑證驗證時要比對的主機名稱，同時作為 SNI 送出。
     ///   預設為 URL 的 host；以 IP 直連但憑證上只有網域名稱時，請帶入該網域。
-    public init(tlsPeerName: String? = nil) {
+    public init(tlsPeerName: String? = nil,
+                multipathServiceType: NWParameters.MultipathServiceType = .handover) {
         self.tlsPeerName = tlsPeerName
+        self.multipathServiceType = multipathServiceType
         //normal connection, will use the "connect" method below
     }
     
@@ -97,18 +106,29 @@ public class TCPTransport: Transport {
             }
         }
         let parameters = NWParameters(tls: tlsOptions, tcp: options)
-        parameters.multipathServiceType = .handover
+        parameters.multipathServiceType = multipathServiceType
         // NWEndpoint.Host(_:) 會自動辨識 IPv4/IPv6 字面值，避免把 IP 當成
         // 網域名稱去做 DNS 解析、也不會送出 IP 形式的 SNI。
         let conn = NWConnection(host: NWEndpoint.Host(parts.host), port: NWEndpoint.Port(rawValue: UInt16(parts.port))!, using: parameters)
+        stateLock.lock()
         connection = conn
+        stateLock.unlock()
         start()
     }
     
     public func disconnect() {
+        stateLock.lock()
+        let conn = connection
         isRunning = false
-        connection?.cancel()
         connection = nil
+        stateLock.unlock()
+        conn?.cancel()
+    }
+    
+    /// 這個 callback 是不是來自「目前」這條連線。
+    private func isActive(_ candidate: NWConnection) -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return isRunning && connection === candidate
     }
     
     public func register(delegate: TransportEventClient?) {
@@ -116,13 +136,19 @@ public class TCPTransport: Transport {
     }
     
     public func write(data: Data, completion: @escaping ((Error?) -> ())) {
-        connection?.send(content: data, completion: .contentProcessed { (error) in
+        stateLock.lock()
+        let conn = connection
+        stateLock.unlock()
+        conn?.send(content: data, completion: .contentProcessed { (error) in
             completion(error)
         })
     }
     
     private func start() {
-        guard let conn = connection else {
+        stateLock.lock()
+        let conn = connection
+        stateLock.unlock()
+        guard let conn = conn else {
             return
         }
         conn.stateUpdateHandler = { [weak self] (newState) in
@@ -160,19 +186,27 @@ public class TCPTransport: Transport {
             self?.delegate?.connectionChanged(state: .shouldReconnect(isBetter))
         }
         
-        conn.start(queue: queue)
+        stateLock.lock()
         isRunning = true
+        stateLock.unlock()
+        conn.start(queue: queue)
         readLoop()
     }
     
     //readLoop keeps reading from the connection to get the latest content
     private func readLoop() {
-        guard isRunning, let connection = connection else {
+        stateLock.lock()
+        let running = isRunning
+        let conn = connection
+        stateLock.unlock()
+        guard running, let connection = conn else {
             return
         }
         
-        connection.receive(minimumIncompleteLength: 2, maximumLength: 4096, completion: { [weak self] (data, context, isComplete, error) in
-            guard let self = self, self.isRunning else {
+        // minimumIncompleteLength 先前是 2：某個 frame 的最後 1 byte 單獨抵達時
+        // receive 會一直等第 2 byte，訊息要到下一則才會一起吐出來，表現成延遲或斷線。
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 4096, completion: { [weak self] (data, context, isComplete, error) in
+            guard let self = self, self.isActive(connection) else {
                 return
             }
             
@@ -192,7 +226,7 @@ public class TCPTransport: Transport {
                 return
             }
             
-            if error == nil && self.isRunning {
+            if error == nil && self.isActive(connection) {
                 self.readLoop()
             } else if let error = error {
                 self.delegate?.connectionChanged(state: .failed(error))

@@ -53,6 +53,12 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
         get { return accessQueue.sync { _didSignalConnected } }
         set { accessQueue.sync(flags: .barrier) { self._didSignalConnected = newValue } }
     }
+    private var _connectGeneration = 0
+    /// 每次 connect 就 +1，讓上一輪殘留的 timeout closure 認得出自己已經過期。
+    private var connectGeneration: Int {
+        get { return accessQueue.sync { _connectGeneration } }
+        set { accessQueue.sync(flags: .barrier) { self._connectGeneration = newValue } }
+    }
     private var _didFailTrust = false
     /// 憑證驗證是否已判定失敗（失敗後不再送出任何成功事件）。
     private var didFailTrust: Bool {
@@ -140,6 +146,8 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
         isOpen = false
         didSignalConnected = false
         didFailTrust = false
+        let generation = connectGeneration + 1
+        connectGeneration = generation
         CFReadStreamSetDispatchQueue(inStream, workQueue)
         CFWriteStreamSetDispatchQueue(outStream, workQueue)
         inStream.open()
@@ -148,6 +156,9 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
         
         workQueue.asyncAfter(deadline: .now() + timeout, execute: { [weak self] in
             guard let s = self else { return }
+            // 先前這個 closure 在連線成功後也不會取消，重連時上一輪殘留的
+            // timeout 會對「新的那一條連線」誤報失敗。
+            guard s.connectGeneration == generation else { return }
             if !s.isOpen && !s.didFailTrust {
                 s.delegate?.connectionChanged(state: .failed(FoundationTransportError.timeout))
             }

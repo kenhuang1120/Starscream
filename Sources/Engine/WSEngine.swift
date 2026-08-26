@@ -40,6 +40,8 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
     private let mutex = DispatchSemaphore(value: 1)
     private var canSend = false
     private var isConnecting = false
+    /// 曾經連線成功過，重連前要先把上一條連線收乾淨。
+    private var needsTransportReset = false
     
     weak var delegate: EngineDelegate?
     public var respondToPingWithPong: Bool = true
@@ -87,7 +89,15 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
         }
         mutex.wait()
         self.isConnecting = true
+        let needsReset = needsTransportReset
+        needsTransportReset = false
         mutex.signal()
+
+        // 上一條連線（例如對方關閉後）可能還握著 socket，重連前先收乾淨，
+        // 否則舊的 NWConnection / stream 會一路累積下去。
+        if needsReset {
+            transport.disconnect()
+        }
         transport.connect(url: url, timeout: request.timeoutInterval, certificatePinning: certPinner)
     }
     
@@ -144,6 +154,9 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
     public func connectionChanged(state: ConnectionState) {
         switch state {
         case .connected:
+            mutex.wait()
+            needsTransportReset = true
+            mutex.signal()
             secKeyValue = HTTPWSHeader.generateWebSocketKey()
             let wsReq = HTTPWSHeader.createUpgrade(request: request,
                                                   supportsCompression: framer.supportsCompression(),
@@ -170,12 +183,13 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
                 }
             }
         case .cancelled:
-            mutex.wait()
-            isConnecting = false
-            mutex.signal()
-            
+            // 先前只清掉 isConnecting，canSend / didUpgrade 仍留在上一條連線的狀態。
+            // start() 的守衛是 (isConnecting || canSend)，所以 App 之後呼叫
+            // connect() 會直接 return 什麼都不做，斷線後就再也連不回來。
+            reset()
             broadcast(event: .cancelled)
         case .peerClosed:
+            reset()
             broadcast(event: .peerClosed)
         }
     }
