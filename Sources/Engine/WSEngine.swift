@@ -37,6 +37,11 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
     private var didUpgrade = false
     private var secKeyValue = ""
     private let writeQueue = DispatchQueue(label: "com.vluxe.starscream.writequeue")
+    private let keepAliveQueue = DispatchQueue(label: "com.vluxe.starscream.keepalive")
+    /// 只保護兩個 timer，跟 mutex 分開以免彼此等待。
+    private let keepAliveLock = NSLock()
+    private var pingTimer: DispatchSourceTimer?
+    private var pongWatchdog: DispatchSourceTimer?
     private let mutex = DispatchSemaphore(value: 1)
     private var canSend = false
     private var isConnecting = false
@@ -45,6 +50,10 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
     
     weak var delegate: EngineDelegate?
     public var respondToPingWithPong: Bool = true
+    /// 每隔多久送一次 ping。設 0 以下表示不送。
+    public var pingInterval: TimeInterval
+    /// 送出 ping 後等待 pong 的上限，逾時就視為連線已死。
+    public var pongTimeout: TimeInterval
     
     public init(transport: Transport,
                 certPinner: CertificatePinning? = nil,
@@ -53,7 +62,11 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
                 framer: Framer? = nil,
                 compressionHandler: CompressionHandler? = nil,
                 cookieStorage: HTTPCookieStorage? = .shared,
-                maxMessageSize: Int = DefaultMaxPayloadLength) {
+                maxMessageSize: Int = DefaultMaxPayloadLength,
+                pingInterval: TimeInterval = 30.0,
+                pongTimeout: TimeInterval = 10.0) {
+        self.pingInterval = pingInterval
+        self.pongTimeout = pongTimeout
         self.transport = transport
         self.framer = framer ?? WSFramer(maxPayloadLength: maxMessageSize)
         self.httpHandler = httpHandler
@@ -113,6 +126,7 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
     }
     
     public func forceStop() {
+        stopKeepAlive()
         mutex.wait()
         isConnecting = false
         mutex.signal()
@@ -219,6 +233,7 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
             }
 
             broadcast(event: .connected(headers))
+            startKeepAlive()
         case .failure(let error):
             handleError(error)
         }
@@ -248,6 +263,7 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
         case .binary(let data):
             broadcast(event: .binary(data))
         case .pong(let data):
+            cancelPongWatchdog()
             broadcast(event: .pong(data))
         case .ping(let data):
             broadcast(event: .ping(data))
@@ -278,7 +294,90 @@ FrameCollectorDelegate, HTTPHandlerDelegate {
         delegate?.didReceive(event: .error(error))
     }
     
+    // MARK: - Keep-alive
+
+    /// 握手完成後開始定期送 ping。用掛在自有 queue 上的 DispatchSourceTimer，
+    /// 而不是 main run loop 的 Timer：App 進背景後 run loop 會停擺、UI 捲動時
+    /// run loop 進入 .tracking mode，兩種情況 Timer 都不會觸發，連線就被
+    /// 伺服器或 NAT 的 idle timeout 砍掉。
+    private func startKeepAlive() {
+        stopKeepAlive()
+        guard pingInterval > 0 else { return }
+
+        let timer = DispatchSource.makeTimerSource(queue: keepAliveQueue)
+        timer.schedule(deadline: .now() + pingInterval, repeating: pingInterval, leeway: .seconds(1))
+        timer.setEventHandler { [weak self] in
+            self?.sendKeepAlivePing()
+        }
+        keepAliveLock.lock()
+        pingTimer = timer
+        keepAliveLock.unlock()
+        timer.resume()
+    }
+
+    private func stopKeepAlive() {
+        keepAliveLock.lock()
+        let ping = pingTimer
+        let watchdog = pongWatchdog
+        pingTimer = nil
+        pongWatchdog = nil
+        keepAliveLock.unlock()
+        ping?.cancel()
+        watchdog?.cancel()
+    }
+
+    /// 收到任何 pong 都代表對方還活著。
+    private func cancelPongWatchdog() {
+        keepAliveLock.lock()
+        let watchdog = pongWatchdog
+        pongWatchdog = nil
+        keepAliveLock.unlock()
+        watchdog?.cancel()
+    }
+
+    private func sendKeepAlivePing() {
+        mutex.wait()
+        let canWrite = canSend
+        mutex.signal()
+        guard canWrite else { return }
+
+        // ping 送得出去不代表對方還活著。行動網路切換造成的半開連線，
+        // 寫入會成功但 pong 永遠不回，因此另外掛一個逾時看門狗。
+        // 必須在寫入「之前」就架好，否則很快回來的 pong 會取消不到它。
+        armPongWatchdogIfNeeded()
+        write(data: Data(), opcode: .ping, completion: nil)
+    }
+
+    private func armPongWatchdogIfNeeded() {
+        keepAliveLock.lock()
+        // 上一個 ping 還在等 pong 時要維持原本的期限，不能重新計時：
+        // 否則只要 pingInterval 小於 pongTimeout，每次 ping 都會把看門狗
+        // 往後推，逾時就永遠不會觸發。
+        guard pongWatchdog == nil else {
+            keepAliveLock.unlock()
+            return
+        }
+        let watchdog = DispatchSource.makeTimerSource(queue: keepAliveQueue)
+        watchdog.schedule(deadline: .now() + pongTimeout)
+        watchdog.setEventHandler { [weak self] in
+            self?.handleKeepAliveTimeout()
+        }
+        pongWatchdog = watchdog
+        keepAliveLock.unlock()
+        watchdog.resume()
+    }
+
+    private func handleKeepAliveTimeout() {
+        stopKeepAlive()
+        let error = WSError(type: .protocolError,
+                            message: "did not receive pong within \(pongTimeout) seconds",
+                            code: CloseCode.protocolError.rawValue)
+        broadcast(event: .error(error))
+        forceStop()
+    }
+
     private func reset() {
+        stopKeepAlive()
         mutex.wait()
         isConnecting = false
         canSend = false

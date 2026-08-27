@@ -224,19 +224,7 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
 
         // ping 送得出去不代表對方還活著。行動網路切換造成的半開連線，
         // send 會成功但 pong 永遠不回，因此另外掛一個逾時看門狗。
-        let watchdog = DispatchSource.makeTimerSource(queue: timerQueue)
-        watchdog.schedule(deadline: .now() + pongTimeout)
-        watchdog.setEventHandler { [weak self] in
-            self?.handleKeepAliveFailure(WSError(type: .protocolError,
-                                                 message: "did not receive pong within \(self?.pongTimeout ?? 0) seconds",
-                                                 code: CloseCode.protocolError.rawValue),
-                                         task: task)
-        }
-        stateLock.lock()
-        pongWatchdog?.cancel()
-        pongWatchdog = watchdog
-        stateLock.unlock()
-        watchdog.resume()
+        armPongWatchdogIfNeeded(task: task)
 
         task.sendPing { [weak self] (error) in
             guard let self = self else { return }
@@ -250,6 +238,29 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
                 self.handleKeepAliveFailure(error, task: task)
             }
         }
+    }
+
+    private func armPongWatchdogIfNeeded(task: URLSessionWebSocketTask) {
+        stateLock.lock()
+        // 上一個 ping 還在等 pong 時要維持原本的期限，不能重新計時：
+        // 否則只要 pingInterval 小於 pongTimeout，每次 ping 都會把看門狗
+        // 往後推，逾時就永遠不會觸發。
+        guard pongWatchdog == nil else {
+            stateLock.unlock()
+            return
+        }
+        let timeout = pongTimeout
+        let watchdog = DispatchSource.makeTimerSource(queue: timerQueue)
+        watchdog.schedule(deadline: .now() + timeout)
+        watchdog.setEventHandler { [weak self] in
+            self?.handleKeepAliveFailure(WSError(type: .protocolError,
+                                                 message: "did not receive pong within \(timeout) seconds",
+                                                 code: CloseCode.protocolError.rawValue),
+                                         task: task)
+        }
+        pongWatchdog = watchdog
+        stateLock.unlock()
+        watchdog.resume()
     }
 
     /// ping 失敗或 pong 逾時：先前只有一行 print，上層完全不知道連線已經死了，
